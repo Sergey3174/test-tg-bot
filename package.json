@@ -1,0 +1,9 @@
+{
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "express": "^5.1.0",
+    "pg": "^8.18.0",
+    "telegraf": "^4.16.3"
+  }
+}
