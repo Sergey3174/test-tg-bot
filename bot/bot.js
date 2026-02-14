@@ -244,7 +244,6 @@ async function assignRoomLeader(leaderTelegramId, roomGameId) {
       return { success: false, message: "Пользователь не найден" };
     }
 
-    // Создаём или обновляем комнату
     const room = await prisma.room.upsert({
       where: { game_id: roomGameId },
       update: {
@@ -257,13 +256,21 @@ async function assignRoomLeader(leaderTelegramId, roomGameId) {
       include: { leader: true },
     });
 
-    // Обновляем роль пользователя
     await prisma.user.update({
       where: { telegram_id: BigInt(leaderTelegramId) },
       data: { role: "ROOM_LEADER" },
     });
 
-    return { success: true, room };
+    // Преобразуем BigInt в строки для безопасной передачи
+    const safeRoom = {
+      ...room,
+      leader_telegram_id: room.leader_telegram_id.toString(),
+      leader: room.leader
+        ? { ...room.leader, telegram_id: room.leader.telegram_id.toString() }
+        : null,
+    };
+
+    return { success: true, room: safeRoom };
   } catch (err) {
     console.error("Ошибка assignRoomLeader:", err);
     return { success: false, message: "Ошибка при назначении руководителя" };
@@ -687,7 +694,7 @@ bot.action(/^SELECT_LEADER_(.+)$/, async (ctx) => {
     // Уведомляем нового руководителя
     try {
       await bot.telegram.sendMessage(
-        BigInt(leaderTelegramId),
+        result.room.leader_telegram_id.toString(),
         `🎉 Тебя назначили руководителем комнаты ${roomGameId}!\n\n` +
           `Твой игровой ID (${roomGameId}) используется как номер комнаты.\n\n` +
           `Теперь ты можешь одобрять заявки на вступление в эту комнату.\n` +
@@ -1220,11 +1227,9 @@ bot.on("message", async (ctx) => {
       },
     });
 
-    if (existingRequest || user.is_in_chat) {
+    if (existingRequest) {
       return ctx.reply(
-        `❌ У тебя уже ${
-          user.is_in_chat ? "есть доступ к комнате" : "активная заявка"
-        }. Ввод нового ID невозможен.`,
+        `❌ У тебя уже "активная заявка". Ввод нового ID невозможен.`,
       );
     }
     // =========================
