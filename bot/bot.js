@@ -8,12 +8,46 @@ dotenv.config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CREATOR_TELEGRAM_ID = BigInt(process.env.CREATOR_TELEGRAM_ID || "0");
-const PRIVATE_CHAT_ID = process.env.PRIVATE_CHAT_ID;
+const CHANNEL_ID = process.env.CHANNEL_ID; // ID канала для проверки подписки
 
 const connectionString = process.env.DATABASE_URL;
 const pool = new Pool({ connectionString });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
+
+// Каждые 1 минуту (можно менять интервал)
+setInterval(async () => {
+  try {
+    // Берём всех пользователей, которые пока не подписаны
+    const users = await prisma.user.findMany({
+      where: { is_in_chat: false },
+    });
+
+    for (const user of users) {
+      try {
+        const member = await bot.telegram.getChatMember(
+          CHANNEL_ID,
+          Number(user.telegram_id),
+        );
+
+        if (["member", "administrator", "creator"].includes(member.status)) {
+          // Пользователь подписан — обновляем БД
+          await prisma.user.update({
+            where: { telegram_id: user.telegram_id },
+            data: { is_in_chat: true },
+          });
+
+          console.log(`✅ Пользователь ${user.telegram_id} теперь подписан`);
+        }
+      } catch (err) {
+        // Если пользователь не подписан или ошибка, просто пропускаем
+        // console.log(err);
+      }
+    }
+  } catch (err) {
+    console.error("Ошибка периодической проверки подписки:", err);
+  }
+}, 60 * 1000); // интервал 1 минута
 
 // ====== Функции для работы с БД ======
 async function getUser(telegramId) {
@@ -274,13 +308,13 @@ async function assignRoomLeader(leaderTelegramId, roomGameId) {
 
 // ====== Функции для администраторов группы ======
 async function isGroupAdmin(userId) {
-  if (!PRIVATE_CHAT_ID) {
-    console.log("⚠️ PRIVATE_CHAT_ID не настроен в .env файле");
+  if (!CHANNEL_ID) {
+    console.log("⚠️ CHANNEL_ID не настроен в .env файле");
     return false;
   }
 
   try {
-    const member = await bot.telegram.getChatMember(PRIVATE_CHAT_ID, userId);
+    const member = await bot.telegram.getChatMember(CHANNEL_ID, userId);
     console.log(`Проверка администратора ${userId}: статус = ${member.status}`);
     return ["administrator", "creator"].includes(member.status);
   } catch (err) {
@@ -376,24 +410,22 @@ bot.start(async (ctx) => {
   await createUser(ctx);
   const user = await getUser(ctx.from.id);
 
-  let isInChat = false;
+  let isSubscribed = false;
 
   try {
-    const member = await bot.telegram.getChatMember(
-      PRIVATE_CHAT_ID,
-      ctx.from.id,
-    );
+    const member = await bot.telegram.getChatMember(CHANNEL_ID, ctx.from.id);
 
+    // Проверяем подписку на канал
     if (["member", "administrator", "creator"].includes(member.status)) {
-      isInChat = true;
+      isSubscribed = true;
     }
   } catch (e) {
-    isInChat = false;
+    isSubscribed = false;
   }
 
   await prisma.user.update({
     where: { telegram_id: BigInt(ctx.from.id) },
-    data: { is_in_chat: isInChat },
+    data: { is_in_chat: isSubscribed }, // Поле остается is_in_chat, но теперь значит "подписан на канал"
   });
 
   if (!user?.game_id) {
@@ -408,8 +440,10 @@ bot.start(async (ctx) => {
   );
 
   if (user.is_in_chat) {
+    // Пользователь подписан на канал
     return showRoomSelection(ctx, user);
   } else {
+    // Новый пользователь - не подписан на канал
     return showRoomForNewUser(ctx, user);
   }
 });
@@ -496,7 +530,7 @@ bot.action(/^SELECT_ROOM_(.+)$/, async (ctx) => {
 
   if (!user.is_in_chat) {
     return ctx.reply(
-      "❌ Ты не в чате. Используй команду /start для вступления.",
+      "❌ Ты не подписан на канал. Используй команду /start для подписки.",
     );
   }
 
@@ -593,51 +627,80 @@ bot.action(/^APPROVE_(.+)$/, async (ctx) => {
   const requestId = ctx.match[1].toString();
   const result = await approveRoomRequest(requestId, ctx.from.id);
 
-  if (result.success) {
-    const request = result.request;
-
-    try {
-      if (PRIVATE_CHAT_ID) {
-        const inviteLink = await bot.telegram.createChatInviteLink(
-          PRIVATE_CHAT_ID.toString(),
-          {
-            member_limit: 1,
-            expires_at: Math.floor(Date.now() / 1000) + 86400,
-          },
-        );
-
-        await bot.telegram.sendMessage(
-          request.user.telegram_id.toString(),
-          `🎉 Твоя заявка одобрена!\n\n` +
-            `Комната: ${request.room.game_id}\n` +
-            `Приглашение в закрытый чат:`,
-          Markup.inlineKeyboard([
-            Markup.button.url("🔗 Вступить в чат", inviteLink.invite_link),
-          ]),
-        );
-
-        await prisma.user.update({
-          where: { telegram_id: request.user.telegram_id.toString() },
-          data: { is_in_chat: true },
-        });
-      } else {
-        await bot.telegram.sendMessage(
-          request.user.telegram_id.toString(),
-          `🎉 Твоя заявка одобрена!\n\n` +
-            `Комната: ${request.room.game_id}\n` +
-            `Ожидай приглашения в закрытый чат.`,
-        );
-      }
-    } catch (err) {
-      console.error("Ошибка отправки приглашения:", err);
-    }
-
-    return ctx.reply(
-      `✅ Заявка одобрена! Пользователю отправлено приглашение.`,
-    );
-  } else {
+  if (!result.success) {
     return ctx.reply(`❌ ${result.message}`);
   }
+
+  const request = result.request;
+
+  try {
+    // Генерируем одноразовую ссылку для канала
+    let inviteLink = null;
+    try {
+      const link = await bot.telegram.createChatInviteLink(CHANNEL_ID, {
+        member_limit: 1,
+      });
+      inviteLink = link.invite_link;
+    } catch (err) {
+      console.error("Не удалось создать invite link:", err);
+      inviteLink = "https://t.me/username_канала"; // fallback на постоянную ссылку
+    }
+
+    // Отправляем пользователю уведомление с кнопкой
+    await bot.telegram.sendMessage(
+      request.user.telegram_id.toString(),
+      `🎉 Твоя заявка одобрена!\n\n` +
+        `Комната: ${request.room.game_id}\n\n` +
+        `Нажми кнопку ниже, чтобы проверить подписку или войти в канал:`,
+      Markup.inlineKeyboard([
+        Markup.button.callback("✅ Проверить / Вступить", `CHECK_SUB`),
+      ]),
+    );
+
+    // Обновляем БД (пока что считаем, что ещё не подписан)
+    await prisma.user.update({
+      where: { telegram_id: request.user.telegram_id },
+      data: { is_in_chat: false },
+    });
+  } catch (err) {
+    console.error("Ошибка отправки уведомления:", err);
+  }
+
+  return ctx.reply(`✅ Заявка одобрена! Пользователь получил уведомление.`);
+});
+
+bot.action("CHECK_SUB", async (ctx) => {
+  await ctx.answerCbQuery();
+
+  let isSubscribed = false;
+
+  try {
+    const member = await bot.telegram.getChatMember(CHANNEL_ID, ctx.from.id);
+    if (["member", "administrator", "creator"].includes(member.status)) {
+      isSubscribed = true;
+    }
+  } catch (err) {
+    isSubscribed = false;
+  }
+
+  if (!isSubscribed) {
+    // Создаём одноразовую ссылку, если ещё не вступил
+    const invite = await bot.telegram.createChatInviteLink(CHANNEL_ID, {
+      member_limit: 1,
+    });
+
+    await ctx.reply(
+      `Ты пока не в канале. Вступи по ссылке:\n${invite.invite_link}`,
+    );
+  } else {
+    await ctx.reply("🎉 Отлично! Ты уже подписан на канал.");
+  }
+
+  // Обновляем поле в БД
+  await prisma.user.update({
+    where: { telegram_id: BigInt(ctx.from.id) },
+    data: { is_in_chat: isSubscribed },
+  });
 });
 
 // Обработка отклонения заявки
@@ -695,29 +758,29 @@ bot.action(/^REMOVE_APPROVED_(.+)$/, async (ctx) => {
 // ====== Команды для администраторов группы ======
 bot.command("group_requests", async (ctx) => {
   console.log(`Команда /group_requests вызвана пользователем ${ctx.from.id}`);
-  console.log(`PRIVATE_CHAT_ID = ${PRIVATE_CHAT_ID || "не установлен"}`);
+  console.log(`CHANNEL_ID = ${CHANNEL_ID || "не установлен"}`);
 
   const isAdmin = await isGroupAdmin(ctx.from.id);
 
   if (!isAdmin) {
-    if (!PRIVATE_CHAT_ID) {
+    if (!CHANNEL_ID) {
       return ctx.reply(
-        "⚠️ Функционал администраторов группы не настроен.\n\n" +
+        "⚠️ Функционал администраторов не настроен.\n\n" +
           "Администратору бота нужно:\n" +
-          "1. Добавить бота в группу\n" +
-          "2. Выполнить команду /chat_id в группе\n" +
-          "3. Добавить полученный ID в .env файл как PRIVATE_CHAT_ID\n" +
+          "1. Добавить бота в канал как администратора\n" +
+          "2. Выполнить команду /channel_id в канале\n" +
+          "3. Добавить полученный ID в .env файл как CHANNEL_ID\n" +
           "4. Перезапустить бота",
       );
     }
 
     return ctx.reply(
-      "❌ Эта команда доступна только администраторам группы.\n\n" +
+      "❌ Эта команда доступна только администраторам канала.\n\n" +
         "Убедись, что:\n" +
-        "1. Ты администратор в группе с ID: " +
-        PRIVATE_CHAT_ID +
+        "1. Ты администратор канала с ID: " +
+        CHANNEL_ID +
         "\n" +
-        "2. Бот добавлен в эту группу\n" +
+        "2. Бот добавлен в этот канал как администратор\n" +
         "3. Ты вызываешь команду в личных сообщениях с ботом",
     );
   }
@@ -909,9 +972,9 @@ bot.command("assign_leader", async (ctx) => {
 
     if (chatUsers.length === 0) {
       return ctx.reply(
-        "❌ Нет пользователей в чате с указанным игровым ID.\n\n" +
+        "❌ Нет пользователей с игровым ID, подписанных на канал.\n\n" +
           "Пользователи должны:\n" +
-          "1. Быть в закрытом чате\n" +
+          "1. Быть подписаны на канал\n" +
           "2. Иметь сохранённый игровой ID",
       );
     }
@@ -1038,7 +1101,7 @@ bot.command("stats", async (ctx) => {
 
   try {
     const totalUsers = await prisma.user.count();
-    const usersInChat = await prisma.user.count({
+    const subscribedUsers = await prisma.user.count({
       where: { is_in_chat: true },
     });
     const totalRooms = await prisma.room.count();
@@ -1056,7 +1119,7 @@ bot.command("stats", async (ctx) => {
     return ctx.reply(
       "📊 Статистика системы:\n\n" +
         `👥 Всего пользователей: ${totalUsers}\n` +
-        `✅ В чате: ${usersInChat}\n` +
+        `✅ Подписано на канал: ${subscribedUsers}\n` +
         `🏠 Комнат: ${totalRooms}\n` +
         `👑 Руководителей: ${totalLeaders}\n` +
         `📝 Всего заявок: ${totalRequests}\n` +
@@ -1100,11 +1163,11 @@ bot.command("users", async (ctx) => {
     for (const u of users) {
       const roleEmoji =
         u.role === "CREATOR" ? "👑" : u.role === "ROOM_LEADER" ? "⭐" : "👤";
-      const inChatEmoji = u.is_in_chat ? "✅" : "❌";
+      const subscribedEmoji = u.is_in_chat ? "✅" : "❌";
       message += `${roleEmoji} ${u.first_name || u.username || "Без имени"}\n`;
       message += `   ID: ${u.telegram_id}\n`;
       message += `   Игровой ID: ${u.game_id || "не указан"}\n`;
-      message += `   В чате: ${inChatEmoji}\n`;
+      message += `   Подписан на канал: ${subscribedEmoji}\n`;
       message += `   Заявок: ${u._count.room_requests}\n\n`;
     }
 
@@ -1129,12 +1192,13 @@ bot.command("help_admin", async (ctx) => {
   return ctx.reply(
     "📖 Справка для администратора:\n\n" +
       "🔹 /admin - Панель администратора\n\n" +
-      "🔹 /assign_leader - Выбрать руководителя из пользователей чата\n" +
-      "   Показывает список пользователей из закрытого чата с игровыми ID.\n" +
+      "🔹 /assign_leader - Выбрать руководителя из подписчиков канала\n" +
+      "   Показывает список пользователей, подписанных на канал и имеющих игровой ID.\n" +
       "   Номер комнаты автоматически устанавливается как игровой ID выбранного пользователя.\n\n" +
       "🔹 /rooms - Просмотр всех комнат и их статуса\n" +
       "🔹 /stats - Статистика системы\n" +
-      "🔹 /users - Список пользователей (первые 50)\n\n" +
+      "🔹 /users - Список пользователей (первые 50)\n" +
+      "🔹 /channel_id - Получить ID канала (вызывать в канале)\n\n" +
       "💡 После назначения руководителя комната создаётся автоматически.\n" +
       "💡 Название комнаты = игровой ID руководителя.",
   );
@@ -1263,8 +1327,8 @@ bot.command("requests", async (ctx) => {
   return ctx.reply(message);
 });
 
-// Команда для получения ID чата
-bot.command("chat_id", async (ctx) => {
+// Команда для получения ID канала/чата
+bot.command("channel_id", async (ctx) => {
   try {
     const chatId = ctx.chat.id;
     const chatType = ctx.chat.type;
@@ -1274,19 +1338,47 @@ bot.command("chat_id", async (ctx) => {
       ctx.chat.username ||
       "Личные сообщения";
 
-    console.log(`Chat ID запрошен: ${chatId}, тип: ${chatType}`);
+    console.log(`Channel ID запрошен: ${chatId}, тип: ${chatType}`);
 
     await ctx.reply(
-      `📋 Информация о чате:\n\n` +
-        `🆔 ID чата: ${chatId}\n` +
+      `📋 Информация о канале/чате:\n\n` +
+        `🆔 ID: ${chatId}\n` +
         `📝 Тип: ${chatType === "private" ? "Личные сообщения" : chatType === "group" ? "Группа" : chatType === "supergroup" ? "Супергруппа" : "Канал"}\n` +
         `📌 Название: ${chatTitle}\n\n` +
         `💡 Скопируй ID и добавь в .env файл как:\n` +
-        `PRIVATE_CHAT_ID=${chatId}`,
+        `CHANNEL_ID=${chatId}\n\n` +
+        `⚠️ Если это личные сообщения, то перешли любое сообщение из канала сюда, и я покажу ID канала.`,
     );
   } catch (err) {
-    console.error("Ошибка команды chat_id:", err);
-    await ctx.reply("❌ Ошибка при получении ID чата");
+    console.error("Ошибка команды channel_id:", err);
+    await ctx.reply("❌ Ошибка при получении ID канала/чата");
+  }
+});
+
+// Обработка пересланных сообщений для получения ID канала
+bot.on("forward_date", async (ctx) => {
+  try {
+    // Проверяем, откуда переслано сообщение
+    if (ctx.message.forward_from_chat) {
+      const forwardedFrom = ctx.message.forward_from_chat;
+
+      await ctx.reply(
+        `📋 Информация о канале:\n\n` +
+          `🆔 ID канала: ${forwardedFrom.id}\n` +
+          `📝 Тип: ${forwardedFrom.type === "channel" ? "Канал" : forwardedFrom.type}\n` +
+          `📌 Название: ${forwardedFrom.title || "Без названия"}\n` +
+          `🔗 Username: ${forwardedFrom.username ? "@" + forwardedFrom.username : "Нет"}\n\n` +
+          `💡 Скопируй ID и добавь в .env файл:\n` +
+          `CHANNEL_ID=${forwardedFrom.id}`,
+      );
+    } else {
+      await ctx.reply(
+        "ℹ️ Перешли сообщение из канала, чтобы узнать его ID.\n\n" +
+          "Также можешь использовать @userinfobot - перешли ему сообщение из канала.",
+      );
+    }
+  } catch (err) {
+    console.error("Ошибка обработки пересланного сообщения:", err);
   }
 });
 
@@ -1314,9 +1406,9 @@ bot.action("ADMIN_ASSIGN_LEADER", async (ctx) => {
 
     if (chatUsers.length === 0) {
       return ctx.reply(
-        "❌ Нет пользователей в чате с указанным игровым ID.\n\n" +
+        "❌ Нет пользователей с игровым ID, подписанных на канал.\n\n" +
           "Пользователи должны:\n" +
-          "1. Быть в закрытом чате\n" +
+          "1. Быть подписаны на канал\n" +
           "2. Иметь сохранённый игровой ID",
       );
     }
@@ -1356,7 +1448,7 @@ bot.action("ADMIN_STATS", async (ctx) => {
 
   try {
     const totalUsers = await prisma.user.count();
-    const usersInChat = await prisma.user.count({
+    const subscribedUsers = await prisma.user.count({
       where: { is_in_chat: true },
     });
     const totalRooms = await prisma.room.count();
@@ -1374,7 +1466,7 @@ bot.action("ADMIN_STATS", async (ctx) => {
     return ctx.reply(
       "📊 Статистика системы:\n\n" +
         `👥 Всего пользователей: ${totalUsers}\n` +
-        `✅ В чате: ${usersInChat}\n` +
+        `✅ Подписано на канал: ${subscribedUsers}\n` +
         `🏠 Комнат: ${totalRooms}\n` +
         `👑 Руководителей: ${totalLeaders}\n` +
         `📝 Всего заявок: ${totalRequests}\n` +
@@ -1455,11 +1547,11 @@ bot.action("ADMIN_USERS", async (ctx) => {
     for (const u of users) {
       const roleEmoji =
         u.role === "CREATOR" ? "👑" : u.role === "ROOM_LEADER" ? "⭐" : "👤";
-      const inChatEmoji = u.is_in_chat ? "✅" : "❌";
+      const subscribedEmoji = u.is_in_chat ? "✅" : "❌";
       message += `${roleEmoji} ${u.first_name || u.username || "Без имени"}\n`;
       message += `   ID: ${u.telegram_id}\n`;
       message += `   Игровой ID: ${u.game_id || "не указан"}\n`;
-      message += `   В чате: ${inChatEmoji}\n`;
+      message += `   Подписан на канал: ${subscribedEmoji}\n`;
       message += `   Заявок: ${u._count.room_requests}\n\n`;
     }
 
