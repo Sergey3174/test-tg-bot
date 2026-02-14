@@ -1,0 +1,51 @@
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "postgresql"
+}
+
+enum UserRole {
+    CREATOR
+    ROOM_LEADER
+    USER
+}
+
+enum RoomRequestStatus {
+    PENDING
+    APPROVED
+    REJECTED
+}
+
+model User {
+    telegram_id   BigInt        @id
+    username      String?
+    first_name    String?
+    game_id       String?
+    role          UserRole      @default(USER)
+    is_in_chat    Boolean       @default(false)
+    room_requests RoomRequest[]
+    managed_rooms Room[]        @relation("RoomLeader")
+    created_at    DateTime      @default(now())
+}
+
+model Room {
+    id                 String        @id @default(uuid())
+    game_id            String        @unique
+    leader_telegram_id BigInt
+    leader             User          @relation("RoomLeader", fields: [leader_telegram_id], references: [telegram_id])
+    requests           RoomRequest[]
+    created_at         DateTime      @default(now())
+}
+
+model RoomRequest {
+    id               String            @id @default(uuid())
+    user_telegram_id BigInt
+    user             User              @relation(fields: [user_telegram_id], references: [telegram_id])
+    room_id          String
+    room             Room              @relation(fields: [room_id], references: [id])
+    status           RoomRequestStatus @default(PENDING)
+    created_at       DateTime          @default(now())
+    approved_at      DateTime?
+}
