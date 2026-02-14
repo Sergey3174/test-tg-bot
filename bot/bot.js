@@ -8,7 +8,7 @@ dotenv.config();
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const CREATOR_TELEGRAM_ID = BigInt(process.env.CREATOR_TELEGRAM_ID || "0");
-const PRIVATE_CHAT_ID = process.env.PRIVATE_CHAT_ID; // ID закрытого чата
+const PRIVATE_CHAT_ID = process.env.PRIVATE_CHAT_ID;
 
 const connectionString = process.env.DATABASE_URL;
 const pool = new Pool({ connectionString });
@@ -43,7 +43,6 @@ async function createUser(ctx) {
       update: {
         username,
         first_name,
-        // Обновляем роль, если пользователь является создателем
         ...(isCreator ? { role: "CREATOR" } : {}),
       },
       create: {
@@ -54,7 +53,6 @@ async function createUser(ctx) {
       },
     });
 
-    // Дополнительная проверка: если пользователь создатель, но роль не CREATOR - обновляем
     if (isCreator && user.role !== "CREATOR") {
       await prisma.user.update({
         where: { telegram_id: BigInt(id) },
@@ -127,7 +125,6 @@ async function getRoomByGameId(gameId) {
 
 async function createRoomRequest(userTelegramId, roomId) {
   try {
-    // Проверяем, нет ли уже активной заявки
     const existing = await prisma.roomRequest.findFirst({
       where: {
         user_telegram_id: BigInt(userTelegramId),
@@ -175,7 +172,6 @@ async function approveRoomRequest(requestId, leaderTelegramId) {
       return { success: false, message: "Ты не руководитель этой комнаты" };
     }
 
-    // Проверяем лимит 60 пользователей
     const approvedCount = await prisma.roomRequest.count({
       where: {
         room_id: request.room_id,
@@ -261,7 +257,6 @@ async function assignRoomLeader(leaderTelegramId, roomGameId) {
       data: { role: "ROOM_LEADER" },
     });
 
-    // Преобразуем BigInt в строки для безопасной передачи
     const safeRoom = {
       ...room,
       leader_telegram_id: room.leader_telegram_id.toString(),
@@ -274,6 +269,105 @@ async function assignRoomLeader(leaderTelegramId, roomGameId) {
   } catch (err) {
     console.error("Ошибка assignRoomLeader:", err);
     return { success: false, message: "Ошибка при назначении руководителя" };
+  }
+}
+
+// ====== Функции для администраторов группы ======
+async function isGroupAdmin(userId) {
+  if (!PRIVATE_CHAT_ID) {
+    console.log("⚠️ PRIVATE_CHAT_ID не настроен в .env файле");
+    return false;
+  }
+
+  try {
+    const member = await bot.telegram.getChatMember(PRIVATE_CHAT_ID, userId);
+    console.log(`Проверка администратора ${userId}: статус = ${member.status}`);
+    return ["administrator", "creator"].includes(member.status);
+  } catch (err) {
+    console.error("Ошибка проверки администратора:", err.message);
+    return false;
+  }
+}
+
+async function getGroupRequests() {
+  try {
+    return await prisma.roomRequest.findMany({
+      where: {
+        status: { in: ["PENDING", "APPROVED"] },
+      },
+      include: {
+        user: true,
+        room: {
+          include: {
+            leader: true,
+          },
+        },
+      },
+      orderBy: { created_at: "desc" },
+    });
+  } catch (err) {
+    console.error("Ошибка получения заявок группы:", err);
+    return [];
+  }
+}
+
+async function adminRejectRequest(requestId) {
+  try {
+    const request = await prisma.roomRequest.findUnique({
+      where: { id: requestId },
+      include: { room: true, user: true },
+    });
+
+    if (!request) {
+      return { success: false, message: "Заявка не найдена" };
+    }
+
+    const updated = await prisma.roomRequest.update({
+      where: { id: requestId },
+      data: { status: "REJECTED" },
+      include: { user: true, room: true },
+    });
+
+    return { success: true, request: updated };
+  } catch (err) {
+    console.error("Ошибка adminRejectRequest:", err);
+    return { success: false, message: "Ошибка при отклонении заявки" };
+  }
+}
+
+// Функция для исключения одобренного пользователя (для руководителей комнат)
+async function removeApprovedUser(requestId, leaderTelegramId) {
+  try {
+    const request = await prisma.roomRequest.findUnique({
+      where: { id: requestId },
+      include: { room: true, user: true },
+    });
+
+    if (!request) {
+      return { success: false, message: "Заявка не найдена" };
+    }
+
+    if (request.room.leader_telegram_id !== BigInt(leaderTelegramId)) {
+      return { success: false, message: "Ты не руководитель этой комнаты" };
+    }
+
+    if (request.status !== "APPROVED") {
+      return {
+        success: false,
+        message: "Можно исключить только одобренных пользователей",
+      };
+    }
+
+    const updated = await prisma.roomRequest.update({
+      where: { id: requestId },
+      data: { status: "REJECTED" },
+      include: { user: true, room: true },
+    });
+
+    return { success: true, request: updated };
+  } catch (err) {
+    console.error("Ошибка removeApprovedUser:", err);
+    return { success: false, message: "Ошибка при исключении пользователя" };
   }
 }
 
@@ -309,16 +403,13 @@ bot.start(async (ctx) => {
     );
   }
 
-  // Пользователь уже ввёл ID - показываем информацию о комнатах
   await ctx.reply(
     `✅ Твой игровой ID: ${user.game_id}\n\nПроверяю доступные комнаты...`,
   );
 
   if (user.is_in_chat) {
-    // Пользователь в чате - показываем выбор комнаты
     return showRoomSelection(ctx, user);
   } else {
-    // Новый пользователь - показываем комнату для вступления
     return showRoomForNewUser(ctx, user);
   }
 });
@@ -334,7 +425,6 @@ async function showRoomSelection(ctx, user) {
     );
   }
 
-  // Фильтруем только комнаты с доступными местами
   const availableRooms = rooms.filter((r) => r._count.requests < 60);
 
   if (availableRooms.length === 0) {
@@ -371,7 +461,6 @@ async function showRoomForNewUser(ctx, user) {
     );
   }
 
-  // Берём первую комнату с доступными местами
   const availableRoom = rooms.find((r) => r._count.requests < 60);
 
   if (!availableRoom) {
@@ -395,7 +484,7 @@ async function showRoomForNewUser(ctx, user) {
   );
 }
 
-// Обработка выбора комнаты (для пользователей в чате)
+// Обработка выбора комнаты
 bot.action(/^SELECT_ROOM_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const roomId = ctx.match[1];
@@ -417,11 +506,10 @@ bot.action(/^SELECT_ROOM_(.+)$/, async (ctx) => {
     const room = result.request.room;
     const leader = room.leader;
 
-    // --- Уведомляем лидера комнаты ---
     try {
       await bot.telegram.sendMessage(
         leader.telegram_id.toString(),
-        `📥 Новая заявка на вступление в комнату ${room.game_id}\n\n` +
+        `🔥 Новая заявка на вступление в комнату ${room.game_id}\n\n` +
           `👤 Пользователь: ${user.first_name || user.username || "Без имени"}\n` +
           `🎮 Игровой ID: ${user.game_id}\n\n` +
           `Подтверди или отклони заявку:`,
@@ -450,7 +538,7 @@ bot.action(/^SELECT_ROOM_(.+)$/, async (ctx) => {
   }
 });
 
-// Обработка "Я вступил" (для новых пользователей)
+// Обработка "Я вступил"
 bot.action(/^JOINED_ROOM_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
   const roomId = ctx.match[1];
@@ -468,8 +556,8 @@ bot.action(/^JOINED_ROOM_(.+)$/, async (ctx) => {
 
     try {
       await bot.telegram.sendMessage(
-        leader.telegram_id.toString(), // 👈 ID лидера в строку
-        `📥 Новая заявка на вступление в комнату ${room.game_id}\n\n` +
+        leader.telegram_id.toString(),
+        `🔥 Новая заявка на вступление в комнату ${room.game_id}\n\n` +
           `👤 Пользователь: ${user.first_name || user.username || "Без имени"}\n` +
           `🎮 Игровой ID: ${user.game_id}\n\n` +
           `Подтверди или отклони заявку:`,
@@ -477,11 +565,11 @@ bot.action(/^JOINED_ROOM_(.+)$/, async (ctx) => {
           [
             Markup.button.callback(
               "✅ Одобрить",
-              `APPROVE_${result.request.id.toString()}`, // 👈 конвертация BigInt
+              `APPROVE_${result.request.id.toString()}`,
             ),
             Markup.button.callback(
               "❌ Отклонить",
-              `REJECT_${result.request.id.toString()}`, // 👈 конвертация BigInt
+              `REJECT_${result.request.id.toString()}`,
             ),
           ],
         ]),
@@ -499,10 +587,10 @@ bot.action(/^JOINED_ROOM_(.+)$/, async (ctx) => {
   }
 });
 
-// Обработка одобрения заявки (для руководителей)
+// Обработка одобрения заявки
 bot.action(/^APPROVE_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
-  const requestId = ctx.match[1].toString(); // 👈 строка
+  const requestId = ctx.match[1].toString();
   const result = await approveRoomRequest(requestId, ctx.from.id);
 
   if (result.success) {
@@ -511,7 +599,7 @@ bot.action(/^APPROVE_(.+)$/, async (ctx) => {
     try {
       if (PRIVATE_CHAT_ID) {
         const inviteLink = await bot.telegram.createChatInviteLink(
-          PRIVATE_CHAT_ID.toString(), // 👈 строка
+          PRIVATE_CHAT_ID.toString(),
           {
             member_limit: 1,
             expires_at: Math.floor(Date.now() / 1000) + 86400,
@@ -519,7 +607,7 @@ bot.action(/^APPROVE_(.+)$/, async (ctx) => {
         );
 
         await bot.telegram.sendMessage(
-          request.user.telegram_id.toString(), // 👈 строка
+          request.user.telegram_id.toString(),
           `🎉 Твоя заявка одобрена!\n\n` +
             `Комната: ${request.room.game_id}\n` +
             `Приглашение в закрытый чат:`,
@@ -529,7 +617,7 @@ bot.action(/^APPROVE_(.+)$/, async (ctx) => {
         );
 
         await prisma.user.update({
-          where: { telegram_id: request.user.telegram_id.toString() }, // 👈 строка
+          where: { telegram_id: request.user.telegram_id.toString() },
           data: { is_in_chat: true },
         });
       } else {
@@ -552,17 +640,16 @@ bot.action(/^APPROVE_(.+)$/, async (ctx) => {
   }
 });
 
-// Обработка отклонения заявки (для руководителей)
+// Обработка отклонения заявки
 bot.action(/^REJECT_(.+)$/, async (ctx) => {
   await ctx.answerCbQuery();
-  const requestId = ctx.match[1].toString(); // 👈 строка
+  const requestId = ctx.match[1].toString();
   const result = await rejectRoomRequest(requestId, ctx.from.id);
 
   if (result.success) {
-    // Уведомляем пользователя
     try {
       await bot.telegram.sendMessage(
-        result.request.user.telegram_id.toString(), // 👈 строка
+        result.request.user.telegram_id.toString(),
         `❌ Твоя заявка на вступление в комнату отклонена.`,
       );
     } catch (err) {
@@ -573,6 +660,199 @@ bot.action(/^REJECT_(.+)$/, async (ctx) => {
   } else {
     return ctx.reply(`❌ ${result.message}`);
   }
+});
+
+// Обработка исключения одобренного пользователя
+bot.action(/^REMOVE_APPROVED_(.+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const requestId = ctx.match[1].toString();
+  const result = await removeApprovedUser(requestId, ctx.from.id);
+
+  if (result.success) {
+    const request = result.request;
+
+    // Уведомляем пользователя об исключении
+    try {
+      await bot.telegram.sendMessage(
+        request.user.telegram_id.toString(),
+        `❌ Тебя исключили из комнаты ${request.room.game_id}.\n\n` +
+          `Руководитель комнаты отменил твоё одобрение.`,
+      );
+    } catch (err) {
+      console.error("Ошибка отправки уведомления:", err);
+    }
+
+    return ctx.editMessageText(
+      `✅ Пользователь ${request.user.first_name || request.user.username || "Без имени"} ` +
+        `исключён из комнаты ${request.room.game_id}.\n\n` +
+        `Используй /requests для просмотра остальных заявок.`,
+    );
+  } else {
+    return ctx.reply(`❌ ${result.message}`);
+  }
+});
+
+// ====== Команды для администраторов группы ======
+bot.command("group_requests", async (ctx) => {
+  console.log(`Команда /group_requests вызвана пользователем ${ctx.from.id}`);
+  console.log(`PRIVATE_CHAT_ID = ${PRIVATE_CHAT_ID || "не установлен"}`);
+
+  const isAdmin = await isGroupAdmin(ctx.from.id);
+
+  if (!isAdmin) {
+    if (!PRIVATE_CHAT_ID) {
+      return ctx.reply(
+        "⚠️ Функционал администраторов группы не настроен.\n\n" +
+          "Администратору бота нужно:\n" +
+          "1. Добавить бота в группу\n" +
+          "2. Выполнить команду /chat_id в группе\n" +
+          "3. Добавить полученный ID в .env файл как PRIVATE_CHAT_ID\n" +
+          "4. Перезапустить бота",
+      );
+    }
+
+    return ctx.reply(
+      "❌ Эта команда доступна только администраторам группы.\n\n" +
+        "Убедись, что:\n" +
+        "1. Ты администратор в группе с ID: " +
+        PRIVATE_CHAT_ID +
+        "\n" +
+        "2. Бот добавлен в эту группу\n" +
+        "3. Ты вызываешь команду в личных сообщениях с ботом",
+    );
+  }
+
+  const requests = await getGroupRequests();
+
+  if (requests.length === 0) {
+    return ctx.reply("📋 Нет активных заявок в группе.");
+  }
+
+  // Группируем заявки по статусу
+  const pending = requests.filter((r) => r.status === "PENDING");
+  const approved = requests.filter((r) => r.status === "APPROVED");
+
+  let message = `📋 Заявки в группе:\n\n`;
+
+  if (pending.length > 0) {
+    message += `⏳ Ожидают одобрения (${pending.length}):\n`;
+    for (const req of pending.slice(0, 10)) {
+      message +=
+        `  • ${req.user.first_name || req.user.username || "Без имени"} ` +
+        `(ID: ${req.user.game_id}) → Комната ${req.room.game_id}\n`;
+    }
+    if (pending.length > 10) {
+      message += `  ... и ещё ${pending.length - 10}\n`;
+    }
+    message += "\n";
+  }
+
+  if (approved.length > 0) {
+    message += `✅ Одобренные (${approved.length}):\n`;
+    for (const req of approved.slice(0, 10)) {
+      message +=
+        `  • ${req.user.first_name || req.user.username || "Без имени"} ` +
+        `(ID: ${req.user.game_id}) → Комната ${req.room.game_id}\n`;
+    }
+    if (approved.length > 10) {
+      message += `  ... и ещё ${approved.length - 10}\n`;
+    }
+  }
+
+  // Добавляем кнопки для управления заявками
+  if (pending.length > 0) {
+    const buttons = pending
+      .slice(0, 5)
+      .map((req) => [
+        Markup.button.callback(
+          `❌ Отклонить: ${req.user.first_name || req.user.username || "Без имени"} (${req.room.game_id})`,
+          `ADMIN_REJECT_${req.id}`,
+        ),
+      ]);
+
+    return ctx.reply(message, Markup.inlineKeyboard(buttons));
+  }
+
+  return ctx.reply(message);
+});
+
+// Обработка отклонения заявки администратором
+bot.action(/^ADMIN_REJECT_(.+)$/, async (ctx) => {
+  const isAdmin = await isGroupAdmin(ctx.from.id);
+
+  if (!isAdmin) {
+    await ctx.answerCbQuery("❌ Только для администраторов группы");
+    return;
+  }
+
+  await ctx.answerCbQuery();
+  const requestId = ctx.match[1].toString();
+  const result = await adminRejectRequest(requestId);
+
+  if (result.success) {
+    const request = result.request;
+
+    // Уведомляем пользователя
+    try {
+      await bot.telegram.sendMessage(
+        request.user.telegram_id.toString(),
+        `❌ Твоя заявка на вступление в комнату ${request.room.game_id} отклонена администратором группы.`,
+      );
+    } catch (err) {
+      console.error("Ошибка отправки уведомления:", err);
+    }
+
+    // Уведомляем руководителя комнаты
+    try {
+      await bot.telegram.sendMessage(
+        request.room.leader_telegram_id.toString(),
+        `ℹ️ Администратор группы отклонил заявку пользователя ${request.user.first_name || request.user.username || "Без имени"} (ID: ${request.user.game_id}) на вступление в комнату ${request.room.game_id}.`,
+      );
+    } catch (err) {
+      console.error("Ошибка отправки уведомления руководителю:", err);
+    }
+
+    return ctx.editMessageText(
+      `✅ Заявка пользователя ${request.user.first_name || request.user.username || "Без имени"} отклонена.\n\n` +
+        `Используй /group_requests для просмотра остальных заявок.`,
+    );
+  } else {
+    return ctx.reply(`❌ ${result.message}`);
+  }
+});
+
+// Команда помощи для администраторов
+bot.command("group_admin_help", async (ctx) => {
+  console.log(`Команда /group_admin_help вызвана пользователем ${ctx.from.id}`);
+
+  const isAdmin = await isGroupAdmin(ctx.from.id);
+
+  if (!isAdmin) {
+    if (!PRIVATE_CHAT_ID) {
+      return ctx.reply(
+        "⚠️ Функционал администраторов группы не настроен.\n\n" +
+          "Обратись к администратору бота для настройки.",
+      );
+    }
+
+    return ctx.reply("❌ Эта команда доступна только администраторам группы.");
+  }
+
+  return ctx.reply(
+    "📖 Команды для администраторов группы:\n\n" +
+      "🔹 /group_requests - Просмотр всех заявок в группе\n" +
+      "   Показывает список ожидающих и одобренных заявок\n" +
+      "   Позволяет отклонить заявку одним нажатием\n\n" +
+      "🔹 /group_admin_help - Эта справка\n\n" +
+      "💡 Как администратор группы, ты можешь:\n" +
+      "• Просматривать все заявки на вступление\n" +
+      "• Отклонять заявки пользователей\n" +
+      "• Контролировать состав участников\n\n" +
+      "ℹ️ Отклонённые заявки:\n" +
+      "• Пользователь получит уведомление об отклонении\n" +
+      "• Руководитель комнаты также будет уведомлён\n" +
+      "• Пользователь сможет подать новую заявку",
+  );
 });
 
 // Меню для создателя
@@ -617,13 +897,12 @@ bot.command("assign_leader", async (ctx) => {
     );
   }
 
-  // Получаем пользователей из чата, у которых есть игровой ID
   try {
     const chatUsers = await prisma.user.findMany({
       where: {
         is_in_chat: true,
         game_id: { not: null },
-        role: { not: "CREATOR" }, // Исключаем создателя
+        role: { not: "CREATOR" },
       },
       orderBy: { first_name: "asc" },
     });
@@ -637,7 +916,6 @@ bot.command("assign_leader", async (ctx) => {
       );
     }
 
-    // Показываем список пользователей для выбора
     const buttons = chatUsers.map((u) => {
       const isLeader = u.role === "ROOM_LEADER";
       const emoji = isLeader ? "⭐" : "👤";
@@ -671,7 +949,6 @@ bot.action(/^SELECT_LEADER_(.+)$/, async (ctx) => {
     return ctx.reply("❌ У тебя нет прав для выполнения этой команды.");
   }
 
-  // Получаем информацию о выбранном пользователе
   const leader = await getUser(leaderTelegramId);
 
   if (!leader) {
@@ -685,13 +962,10 @@ bot.action(/^SELECT_LEADER_(.+)$/, async (ctx) => {
     );
   }
 
-  // Используем игровой ID как номер комнаты
   const roomGameId = leader.game_id;
-
   const result = await assignRoomLeader(leaderTelegramId, roomGameId);
 
   if (result.success) {
-    // Уведомляем нового руководителя
     try {
       await bot.telegram.sendMessage(
         result.room.leader_telegram_id.toString(),
@@ -714,60 +988,7 @@ bot.action(/^SELECT_LEADER_(.+)$/, async (ctx) => {
   }
 });
 
-// Старая команда для ручного назначения (оставляем для совместимости)
-bot.command("assign_leader_manual", async (ctx) => {
-  const user = await getUser(ctx.from.id);
-  const isCreator = BigInt(ctx.from.id) === CREATOR_TELEGRAM_ID;
-
-  if (!isCreator && (!user || user.role !== "CREATOR")) {
-    return ctx.reply(
-      "❌ У тебя нет прав для выполнения этой команды.\n\n" +
-        "Используй /update_role для обновления роли.",
-    );
-  }
-
-  const args = ctx.message.text.split(" ").slice(1);
-  if (args.length < 2) {
-    return ctx.reply(
-      "📝 Использование: /assign_leader_manual <telegram_id> <room_game_id>\n\n" +
-        "Пример: /assign_leader_manual 123456789 987654321\n\n" +
-        "💡 <telegram_id> - Telegram ID пользователя\n" +
-        "💡 <room_game_id> - Игровой ID комнаты (будет использован как название комнаты)\n\n" +
-        "💡 Рекомендуется использовать /assign_leader для выбора из списка пользователей чата.",
-    );
-  }
-
-  const [leaderTelegramId, roomGameId] = args;
-
-  if (!/^\d+$/.test(leaderTelegramId) || !/^\d+$/.test(roomGameId)) {
-    return ctx.reply("❌ ID должны состоять только из цифр.");
-  }
-
-  const result = await assignRoomLeader(leaderTelegramId, roomGameId);
-
-  if (result.success) {
-    // Уведомляем нового руководителя
-    try {
-      await bot.telegram.sendMessage(
-        BigInt(leaderTelegramId),
-        `🎉 Тебя назначили руководителем комнаты ${roomGameId}!\n\n` +
-          `Теперь ты можешь одобрять заявки на вступление в эту комнату.\n` +
-          `Используй команду /requests для просмотра заявок.`,
-      );
-    } catch (err) {
-      console.error("Ошибка отправки уведомления:", err);
-    }
-
-    return ctx.reply(
-      `✅ Пользователь ${leaderTelegramId} назначен руководителем комнаты ${roomGameId}.\n\n` +
-        `Руководитель получил уведомление.`,
-    );
-  } else {
-    return ctx.reply(`❌ ${result.message}`);
-  }
-});
-
-// Команда для просмотра всех комнат (для создателя)
+// Команда для просмотра всех комнат
 bot.command("rooms", async (ctx) => {
   const user = await getUser(ctx.from.id);
   const isCreator = BigInt(ctx.from.id) === CREATOR_TELEGRAM_ID;
@@ -804,7 +1025,7 @@ bot.command("rooms", async (ctx) => {
   return ctx.reply(message);
 });
 
-// Команда для статистики (для создателя)
+// Команда для статистики
 bot.command("stats", async (ctx) => {
   const user = await getUser(ctx.from.id);
   const isCreator = BigInt(ctx.from.id) === CREATOR_TELEGRAM_ID;
@@ -848,7 +1069,7 @@ bot.command("stats", async (ctx) => {
   }
 });
 
-// Команда для просмотра пользователей (для создателя)
+// Команда для просмотра пользователей
 bot.command("users", async (ctx) => {
   const user = await getUser(ctx.from.id);
   const isCreator = BigInt(ctx.from.id) === CREATOR_TELEGRAM_ID;
@@ -911,14 +1132,36 @@ bot.command("help_admin", async (ctx) => {
       "🔹 /assign_leader - Выбрать руководителя из пользователей чата\n" +
       "   Показывает список пользователей из закрытого чата с игровыми ID.\n" +
       "   Номер комнаты автоматически устанавливается как игровой ID выбранного пользователя.\n\n" +
-      "🔹 /assign_leader_manual <telegram_id> <room_game_id> - Ручное назначение\n" +
-      "   Пример: /assign_leader_manual 123456789 987654321\n\n" +
       "🔹 /rooms - Просмотр всех комнат и их статуса\n" +
       "🔹 /stats - Статистика системы\n" +
       "🔹 /users - Список пользователей (первые 50)\n\n" +
       "💡 После назначения руководителя комната создаётся автоматически.\n" +
-      "💡 Название комнаты = игровой ID руководителя.\n" +
-      "💡 Рекомендуется использовать /assign_leader для удобного выбора из списка.",
+      "💡 Название комнаты = игровой ID руководителя.",
+  );
+});
+
+// Справка для руководителей комнат
+bot.command("help_leader", async (ctx) => {
+  const user = await getUser(ctx.from.id);
+
+  if (!user || user.role !== "ROOM_LEADER") {
+    return ctx.reply("❌ Эта команда доступна только руководителям комнат.");
+  }
+
+  return ctx.reply(
+    "📖 Справка для руководителя комнаты:\n\n" +
+      "🔹 /requests - Просмотр всех заявок в твоих комнатах\n" +
+      "   Показывает:\n" +
+      "   • ⏳ Ожидающие одобрения заявки\n" +
+      "   • ✅ Уже одобренные пользователи\n\n" +
+      "💡 Что ты можешь делать:\n" +
+      "• Одобрить ожидающую заявку (кнопка ✅)\n" +
+      "• Отклонить ожидающую заявку (кнопка ❌)\n" +
+      "• Исключить одобренного пользователя (кнопка ❌)\n\n" +
+      "ℹ️ При исключении:\n" +
+      "• Пользователь получит уведомление\n" +
+      "• Заявка будет помечена как отклонённая\n" +
+      "• Пользователь сможет подать новую заявку",
   );
 });
 
@@ -936,7 +1179,7 @@ bot.command("requests", async (ctx) => {
     where: { leader_telegram_id: BigInt(ctx.from.id) },
     include: {
       requests: {
-        where: { status: "PENDING" },
+        where: { status: { in: ["PENDING", "APPROVED"] } },
         include: { user: true },
         orderBy: { created_at: "desc" },
       },
@@ -947,6 +1190,8 @@ bot.command("requests", async (ctx) => {
     return ctx.reply("❌ У тебя нет комнат для управления.");
   }
 
+  let hasPending = false;
+  let hasApproved = false;
   let message = "📋 Заявки на вступление:\n\n";
 
   for (const room of rooms) {
@@ -955,13 +1200,64 @@ bot.command("requests", async (ctx) => {
       continue;
     }
 
+    const pending = room.requests.filter((r) => r.status === "PENDING");
+    const approved = room.requests.filter((r) => r.status === "APPROVED");
+
     message += `🎮 Комната ${room.game_id}:\n`;
-    for (const request of room.requests) {
-      message +=
-        `  • ${request.user.first_name || request.user.username || "Без имени"} ` +
-        `(ID: ${request.user.game_id})\n`;
+
+    if (pending.length > 0) {
+      hasPending = true;
+      message += `\n⏳ Ожидают одобрения (${pending.length}):\n`;
+      for (const request of pending) {
+        message +=
+          `  • ${request.user.first_name || request.user.username || "Без имени"} ` +
+          `(ID: ${request.user.game_id})\n`;
+      }
     }
+
+    if (approved.length > 0) {
+      hasApproved = true;
+      message += `\n✅ Одобренные (${approved.length}):\n`;
+      for (const request of approved) {
+        message +=
+          `  • ${request.user.first_name || request.user.username || "Без имени"} ` +
+          `(ID: ${request.user.game_id})\n`;
+      }
+    }
+
     message += "\n";
+  }
+
+  // Создаем кнопки для управления заявками
+  const buttons = [];
+
+  for (const room of rooms) {
+    const pending = room.requests.filter((r) => r.status === "PENDING");
+    const approved = room.requests.filter((r) => r.status === "APPROVED");
+
+    // Кнопки для одобрения ожидающих заявок
+    for (const request of pending.slice(0, 3)) {
+      buttons.push([
+        Markup.button.callback(
+          `✅ Одобрить: ${request.user.first_name || request.user.username} (${room.game_id})`,
+          `APPROVE_${request.id}`,
+        ),
+      ]);
+    }
+
+    // Кнопки для отклонения/исключения одобренных заявок
+    for (const request of approved.slice(0, 3)) {
+      buttons.push([
+        Markup.button.callback(
+          `❌ Исключить: ${request.user.first_name || request.user.username} (${room.game_id})`,
+          `REMOVE_APPROVED_${request.id}`,
+        ),
+      ]);
+    }
+  }
+
+  if (buttons.length > 0) {
+    return ctx.reply(message, Markup.inlineKeyboard(buttons));
   }
 
   return ctx.reply(message);
@@ -994,7 +1290,7 @@ bot.command("chat_id", async (ctx) => {
   }
 });
 
-// Обработчик кнопки назначения руководителя
+// Обработчики кнопок администратора
 bot.action("ADMIN_ASSIGN_LEADER", async (ctx) => {
   await ctx.answerCbQuery();
   const user = await getUser(ctx.from.id);
@@ -1006,7 +1302,6 @@ bot.action("ADMIN_ASSIGN_LEADER", async (ctx) => {
     );
   }
 
-  // Получаем пользователей из чата, у которых есть игровой ID
   try {
     const chatUsers = await prisma.user.findMany({
       where: {
@@ -1026,7 +1321,6 @@ bot.action("ADMIN_ASSIGN_LEADER", async (ctx) => {
       );
     }
 
-    // Показываем список пользователей для выбора
     const buttons = chatUsers.map((u) => {
       const isLeader = u.role === "ROOM_LEADER";
       const emoji = isLeader ? "⭐" : "👤";
@@ -1049,7 +1343,6 @@ bot.action("ADMIN_ASSIGN_LEADER", async (ctx) => {
   }
 });
 
-// Обработчики кнопок администратора
 bot.action("ADMIN_STATS", async (ctx) => {
   await ctx.answerCbQuery();
   const user = await getUser(ctx.from.id);
@@ -1177,27 +1470,9 @@ bot.action("ADMIN_USERS", async (ctx) => {
   }
 });
 
-// Альтернативный способ получения ID - просто отправить любое сообщение в чат
-// bot.on("message", async (ctx) => {
-//   // Если это команда /get_chat_id (альтернатива)
-//   if (ctx.message.text === "/get_chat_id" || ctx.message.text === "!chat_id") {
-//     try {
-//       const chatId = ctx.chat.id;
-//       await ctx.reply(
-//         `🆔 ID этого чата: ${chatId}\n\n` +
-//           `Добавь в .env:\nPRIVATE_CHAT_ID=${chatId}`,
-//       );
-//     } catch (err) {
-//       console.error("Ошибка:", err);
-//     }
-//     return;
-//   }
-// });
-
 // Обработка ввода игрового ID
 bot.on("message", async (ctx) => {
   if (ctx.chat.type !== "private") return;
-  // Пропускаем команды
   if (ctx.message.text.startsWith("/")) return;
 
   try {
@@ -1217,9 +1492,6 @@ bot.on("message", async (ctx) => {
 
     if (!user) return ctx.reply("❌ Ошибка при создании пользователя.");
 
-    // =========================
-    // Проверка существующей заявки
-    // =========================
     const existingRequest = await prisma.roomRequest.findFirst({
       where: {
         user_telegram_id: BigInt(telegramId),
@@ -1229,10 +1501,9 @@ bot.on("message", async (ctx) => {
 
     if (existingRequest) {
       return ctx.reply(
-        `❌ У тебя уже "активная заявка". Ввод нового ID невозможен.`,
+        `❌ У тебя уже активная заявка. Ввод нового ID невозможен.`,
       );
     }
-    // =========================
 
     const saved = await saveGameId(telegramId, text);
     if (!saved)
@@ -1241,7 +1512,6 @@ bot.on("message", async (ctx) => {
     user = await getUser(telegramId);
     if (!user) return ctx.reply("❌ Ошибка при получении данных пользователя.");
 
-    // После сохранения ID показываем информацию о комнатах
     await ctx.reply(
       `✅ Твой игровой ID сохранён: ${text}\n\nПроверяю доступные комнаты...`,
     );
@@ -1262,7 +1532,7 @@ async function initTables() {
   try {
     await pool.query(`
       DO $$ BEGIN
-        CREATE TYPE "UserRole" AS ENUM ('CREATOR', 'ROOM_LEADER', 'USER');
+        CREATE TYPE "UserRole" AS ENUM ('CREATOR', 'ROOM_LEADER', 'ADMIN', 'USER');
       EXCEPTION
         WHEN duplicate_object THEN null;
       END $$;
@@ -1278,7 +1548,6 @@ async function initTables() {
     console.error("Ошибка создания типов:", err.message);
   }
 
-  // Создаём или обновляем таблицу User
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS "User" (
@@ -1292,7 +1561,6 @@ async function initTables() {
       );
     `);
 
-    // Добавляем недостающие колонки, если таблица уже существовала
     await pool.query(`
       DO $$ 
       BEGIN
@@ -1323,7 +1591,6 @@ async function initTables() {
     console.error("Ошибка создания/обновления таблицы User:", err.message);
   }
 
-  // Создаём таблицу Room
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS "Room" (
@@ -1338,7 +1605,6 @@ async function initTables() {
     console.error("Ошибка создания таблицы Room:", err.message);
   }
 
-  // Создаём таблицу RoomRequest
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS "RoomRequest" (
@@ -1363,7 +1629,7 @@ async function initTables() {
   try {
     await initTables();
     await bot.launch();
-    console.log("🤖 Bot started with Prisma");
+    console.log("🤖 Bot started with Prisma and Group Admin features");
   } catch (err) {
     console.error("Ошибка запуска бота:", err);
   }
