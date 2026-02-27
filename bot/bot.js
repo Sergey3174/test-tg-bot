@@ -1,5 +1,7 @@
 import { Telegraf, Markup } from "telegraf";
-import { PrismaClient } from "@prisma/client";
+import * as Prisma from "@prisma/client";
+const { PrismaClient } = Prisma;
+
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Pool } from "pg";
 import dotenv from "dotenv";
