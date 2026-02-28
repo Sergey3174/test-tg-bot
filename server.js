@@ -1,4 +1,5 @@
 import express from "express";
+import "./bot/bot.js";
 
 const app = express();
 const PORT = 3000;
